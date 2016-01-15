@@ -8,95 +8,82 @@
   (let [invokes (filter #(= "invoke" (.getName %1)) (.getDeclaredMethods (class f)))]
   (apply max (map #(alength (.getParameterTypes %1)) invokes))))
 
-(defn load-reactor [functions data stop-fn]
-  ;(println "Loading reactor - data: " data)
-  {:functions (shuffle functions) :data (shuffle data) :stop-fn stop-fn})
+(defn reactor [formulae reactions reactants stop-fn]
+  (let [r {:formulae formulae
+           :arity-tally (apply + (map arity formulae))
+           :reactions (ref reactions)
+           :reactants (ref reactants)
+           :stop-fn stop-fn}]
+    r))
 
-(defn reaction-cycle [reactor]
-  (let [f (first (:functions reactor))
-        ;_ (println f)
-        a (arity f)
-        args (take a (:data reactor))
-        rest (drop a (:data reactor))]
-    ;(println f a args rest)
-    (load-reactor (:functions reactor) (concat (apply f args) rest) (:stop-fn reactor))))
+(defn set-stop-flag [bool rctr]
+  (dosync (alter (:stop-flag rctr) (fn [_] bool))))
 
-(defn get-sub-reactors [reactor]
-  (loop [subs []
-         rems reactor]
-    (if (= 0 (count (:functions rems)))
-      [rems subs]
-      (let [f (first (:functions rems))
-            a (arity f)]
-        (if (< (count (:functions rems)) a)
-          [rems subs]
-          (let [args (take a (:data rems))]
-            (recur (conj subs (concat [f] args))
-                   {:functions (rest (:functions rems)) :data (drop a (:data rems))})))))))
+(defn clear-reactions [rctr]
+  (dosync (ref-set (:reactions rctr) ())))
 
-(defn p-reaction-cycle [reactor]
-  (let [[remainders subs] (get-sub-reactors reactor)
-        mapped (pmap #(apply (first %) (rest %)) subs)
-        leftover-data (:data remainders)
-        new-data (reduce concat leftover-data mapped)]
-    ;(println "In p-reaction-cycle: " subs leftover-data)
-    (load-reactor (:functions reactor) new-data (:stop-fn reactor))))
+(defn obtain-reactants [rctr]
+  (dosync
+    (let [r @(:reactants rctr)]
+      (alter (:reactants rctr) (fn [_] ()))
+      r)))
 
-(defn run-reactor [reactor]
-  (loop [r reactor]
-    ;(println "Cycling reactor - data: " (:data r))
-    (if (apply (:stop-fn r) [r])
-      r
-      (recur (p-reaction-cycle r)))))
+(defn get-reactions [rctr]
+  (let [arg-arity (map arity (:formulae rctr))
+        arg-tally (reduce + arg-arity)
+        shuffled-reactants (shuffle (obtain-reactants rctr))
+        parts (partition arg-tally arg-tally [] shuffled-reactants)]
+    (letfn [(process-partition [part]
+              (if (= (count part) arg-tally)
+                (loop [reactions []
+                       remaining part
+                       f (:formulae rctr)
+                       ar arg-arity]
+                  (if (empty? f)
+                    (dosync (alter (:reactions rctr) concat reactions))
+                    (let [arity (first ar)
+                          args (take arity remaining)]
+                      (recur (conj reactions{:function (first f) :args args})
+                             (drop arity remaining)
+                             (rest f)
+                             (rest ar)))))
+                (loop [reactions []
+                       remaining part]
+                  (let [f (rand-nth (:formulae rctr))
+                        a (arity f)
+                        args (take a remaining)]
+                    (if (= (count args) a)
+                      (recur (conj reactions {:function f :args args}) (drop a remaining))
+                      (dosync
+                        (alter (:reactions rctr) concat reactions)
+                        (alter (:reactants rctr) (fn [_] remaining))))))))]
+     (doall (map process-partition parts)))))
 
+(defn process-reactions [rctr]
+  (letfn [(react [reaction]
+            (let [result (apply (:function reaction) (:args reaction))]
+              (dosync (alter (:reactants rctr) concat result))))]
+    (doall (map react (dosync @(:reactions rctr))))))
 
-(defn gilbert [functions data stop-fn extract-fn]
+(defn step-reactor [rctr]
+  (println rctr)
+  (get-reactions rctr)
+  (println rctr)
+  (process-reactions rctr)
+  (println rctr)
+  (clear-reactions rctr))
+
+(defn cycle-reactor [rctr]
+  (loop []
+    (if ((:stop-fn rctr) rctr)
+      rctr
+      (do
+        (step-reactor rctr)
+        (recur)))))
+
+(defn gilbert [formulae reactants stop-fn extract-fn]
   "The gilbert chemical programing system"
-  (let [reactor (load-reactor functions data stop-fn)]
-    (extract-fn (run-reactor reactor))))
+  (let [rctr (reactor formulae [] reactants stop-fn)
+        _ (cycle-reactor rctr)]
+    (extract-fn rctr)))
 
-
-;; test functions - max
-(defn cmax [a b] (if (> a b) [a a] [b b]))
-(defn stop-max [reactor] (apply = (:data reactor)))
-(defn extract-max [reactor] (first (:data reactor)))
-
-;(time (gilbert (vec (repeat 2 cmax)) (vec (range 9)) stop-max extract-max))
-;(time (gilbert (vec (repeat 8 cmax)) (vec (range 99)) stop-max extract-max))
-;(time (gilbert (vec (repeat 100 cmax)) (vec (range 10000)) stop-max extract-max))
-;(time (gilbert (vec (repeat 300 cmax)) (vec (range 100000)) stop-max extract-max))
-
-;; test functions - merge sort
-(defn prim-merge [pred left right]
-    (loop [v [] l left r right]
-        (if (and (seq l) (seq r))
-            (if (pred (first l) (first r))
-                (recur (conj v (first l)) (rest l) r)
-                (recur (conj v (first r)) l (rest r)))
-            (vec (concat v l r)))))
-
-(defn sorted [a]
-  (or (<= (count a) 1) (apply < a)))
-
-(defn split-data [v]
-  (if (sorted v)
-    [v]
-    (let [c (quot (count v) 2)]
-      [(subvec v 0 c) (subvec v c)])))
-
-
-(defn merge-data [a b]
-  (if (and (sorted a) (sorted b))
-      [(prim-merge < a b)]
-        [a b]))
-
-(defn mergesort-extract [reactor]
-  (first (:data reactor)))
-
-(defn mergesort-stop [reactor]
-  (let [data (:data reactor)]
-    (and (<= (count data) 1) (sorted (first data)))))
-
-;(time (gilbert (concat (vec (repeat 3 split-data)) (vec (repeat 3 merge-data))) [(vec (shuffle (range 100)))] mergesort-stop mergesort-extract))
-;(time (gilbert (concat (vec (repeat 5 split-data)) (vec (repeat 5 merge-data))) [(vec (shuffle (range 1000)))] mergesort-stop mergesort-extract))
-;(time (gilbert (concat (vec (repeat 50 split-data)) (vec (repeat 50 merge-data))) [(vec (shuffle (range 100000)))] mergesort-stop mergesort-extract))
